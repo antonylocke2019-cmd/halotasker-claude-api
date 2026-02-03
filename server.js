@@ -1,11 +1,9 @@
 /**
- * HaloTasker AI Backend
+ * HaloTasker AI Backend (USD Budget Controlled)
  * - File understanding (images + documents)
- * - Thinking modes (quick / balanced / deep)
- * - Usage tracking:
- *   - Last message cost
- *   - Session total cost
- *   - Remaining balance
+ * - Thinking modes
+ * - Usage tracking (USD)
+ * - Manual balance reset
  * - Lovable + Railway compatible
  */
 
@@ -26,13 +24,13 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
   : [];
 
-// Enable deep reasoning (Opus)
+// Deep reasoning (Opus)
 const ALLOW_DEEP = process.env.ALLOW_OPUS === "true";
 
-// Monthly/session budget you control
-const SESSION_BUDGET_GBP = 10.0;
+// Starting balance (USD)
+const STARTING_BALANCE_USD = 10.0;
 
-// Pricing per 1,000,000 tokens (GBP – estimated)
+// Pricing per 1,000,000 tokens (USD – estimated)
 const PRICING = {
   "claude-haiku-4-20250514": { input: 0.25, output: 1.25 },
   "claude-sonnet-4-20250514": { input: 3.0, output: 15.0 },
@@ -40,7 +38,7 @@ const PRICING = {
 };
 
 if (!process.env.ANTHROPIC_API_KEY) {
-  console.error("ANTHROPIC_API_KEY is missing");
+  console.error("ANTHROPIC_API_KEY missing");
   process.exit(1);
 }
 
@@ -93,14 +91,33 @@ app.use(
 );
 
 // -----------------------------------------------------------------------------
+// Session usage (in-memory)
+// NOTE: Perfect for Lovable Edge sessions
+// -----------------------------------------------------------------------------
+
+const sessionUsage = {
+  totalUSD: 0
+};
+
+// -----------------------------------------------------------------------------
 // Routes
 // -----------------------------------------------------------------------------
 
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
-    modes: Object.keys(THINKING_MODES),
+    balanceUSD: Number((STARTING_BALANCE_USD - sessionUsage.totalUSD).toFixed(2)),
     deepEnabled: ALLOW_DEEP
+  });
+});
+
+// Reset balance endpoint
+app.post("/api/reset-balance", (req, res) => {
+  sessionUsage.totalUSD = 0;
+
+  return res.json({
+    success: true,
+    balanceUSD: STARTING_BALANCE_USD
   });
 });
 
@@ -113,6 +130,18 @@ app.post("/api/chat", async (req, res) => {
       attachments = []
     } = req.body;
 
+    // Hard stop when balance is exhausted
+    if (STARTING_BALANCE_USD - sessionUsage.totalUSD <= 0) {
+      return res.json({
+        reply: "Your balance has been exhausted. Please reset to continue.",
+        usage: {
+          lastMessageUSD: 0,
+          sessionTotalUSD: Number(sessionUsage.totalUSD.toFixed(2)),
+          remainingUSD: 0
+        }
+      });
+    }
+
     if (!message || typeof message !== "string") {
       return res.json({ reply: "Please enter a valid message." });
     }
@@ -123,17 +152,12 @@ app.post("/api/chat", async (req, res) => {
         ? THINKING_MODES[thinkingMode]
         : THINKING_MODES.balanced;
 
-    // Build multimodal content (text + images + documents)
+    // Build multimodal content
     const content = [{ type: "text", text: message }];
 
     if (Array.isArray(attachments)) {
       attachments.forEach(file => {
-        // Image vision
-        if (
-          file.type &&
-          file.type.startsWith("image/") &&
-          file.base64
-        ) {
+        if (file.type?.startsWith("image/") && file.base64) {
           content.push({
             type: "image",
             source: {
@@ -144,7 +168,6 @@ app.post("/api/chat", async (req, res) => {
           });
         }
 
-        // Text documents
         if (file.content && typeof file.content === "string") {
           content.push({
             type: "text",
@@ -155,18 +178,8 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const messages = [
-      ...Array.isArray(history)
-        ? history.filter(
-            m =>
-              m &&
-              (m.role === "user" || m.role === "assistant") &&
-              typeof m.content === "string"
-          )
-        : [],
-      {
-        role: "user",
-        content
-      }
+      ...(Array.isArray(history) ? history : []),
+      { role: "user", content }
     ];
 
     const response = await anthropic.messages.create({
@@ -174,40 +187,35 @@ app.post("/api/chat", async (req, res) => {
       max_tokens: mode.maxTokens,
       messages,
       system:
-        "You are HaloTasker AI. Use uploaded files and images as authoritative context when provided. Be accurate, clear, and helpful."
+        "You are HaloTasker AI. Use uploaded files and images as authoritative context. Be accurate and helpful."
     });
 
     const replyText =
       response?.content?.[0]?.text ||
       "Sorry, I couldn’t generate a response.";
 
-    // -------------------------------------------------------------------------
-    // Usage & cost calculation
-    // -------------------------------------------------------------------------
-
+    // Usage calculation
     const usage = response.usage || { input_tokens: 0, output_tokens: 0 };
-    const pricing = PRICING[mode.model] || { input: 0, output: 0 };
+    const pricing = PRICING[mode.model];
 
-    const lastMessageCostGBP =
+    const lastMessageUSD =
       (usage.input_tokens / 1_000_000) * pricing.input +
       (usage.output_tokens / 1_000_000) * pricing.output;
 
-    // In-memory session tracking (Lovable-safe)
-    req.sessionUsage = req.sessionUsage || { total: 0 };
-    req.sessionUsage.total += lastMessageCostGBP;
+    sessionUsage.totalUSD += lastMessageUSD;
 
-    const remainingGBP = Math.max(
+    const remainingUSD = Math.max(
       0,
-      SESSION_BUDGET_GBP - req.sessionUsage.total
+      STARTING_BALANCE_USD - sessionUsage.totalUSD
     );
 
     return res.json({
       reply: replyText,
       thinkingMode,
       usage: {
-        lastMessageGBP: Number(lastMessageCostGBP.toFixed(4)),
-        sessionTotalGBP: Number(req.sessionUsage.total.toFixed(2)),
-        remainingGBP: Number(remainingGBP.toFixed(2))
+        lastMessageUSD: Number(lastMessageUSD.toFixed(4)),
+        sessionTotalUSD: Number(sessionUsage.totalUSD.toFixed(2)),
+        remainingUSD: Number(remainingUSD.toFixed(2))
       }
     });
   } catch (err) {
@@ -224,5 +232,5 @@ app.post("/api/chat", async (req, res) => {
 // -----------------------------------------------------------------------------
 
 app.listen(PORT, () => {
-  console.log("HaloTasker AI backend running");
+  console.log("HaloTasker AI backend running (USD mode)");
 });
