@@ -1,6 +1,9 @@
 /**
- * HaloTasker Claude Chat - Backend API
- * Lovable + Railway compatible (non-streaming, always 200 responses)
+ * HaloTasker Claude Chat API
+ * Railway + Lovable compatible
+ * - Non-streaming
+ * - Always returns 200
+ * - Supports model selection (Opus / Sonnet / Haiku)
  */
 
 import express from "express";
@@ -27,6 +30,13 @@ if (!process.env.ANTHROPIC_API_KEY) {
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY
 });
+
+// Claude model mapping (friendly → real)
+const MODEL_MAP = {
+  opus: "claude-opus-4-20250514",
+  sonnet: "claude-sonnet-4-20250514",
+  haiku: "claude-haiku-4-20250514"
+};
 
 // -----------------------------------------------------------------------------
 // App setup
@@ -69,19 +79,22 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    model: "claude-sonnet-4-20250514"
+    models: ["opus", "sonnet", "haiku"],
+    default_model: "sonnet"
   });
 });
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message, history = [] } = req.body;
+    const { message, history = [], model } = req.body;
 
     if (!message || typeof message !== "string") {
       return res.json({
-        reply: "Please send a valid message."
+        reply: "Please enter a valid message."
       });
     }
+
+    const selectedModel = MODEL_MAP[model] || MODEL_MAP.sonnet;
 
     const messages = [
       ...Array.isArray(history)
@@ -96,7 +109,7 @@ app.post("/api/chat", async (req, res) => {
     ];
 
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: selectedModel,
       max_tokens: 1024,
       messages,
       system:
@@ -111,7 +124,7 @@ app.post("/api/chat", async (req, res) => {
   } catch (error) {
     console.error("Claude API error:", error);
 
-    // IMPORTANT: Always return 200 for Lovable compatibility
+    // IMPORTANT: Lovable requires HTTP 200 even on failure
     return res.json({
       reply: "Sorry, something went wrong. Please try again."
     });
@@ -119,7 +132,7 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Start
+// Start server
 // -----------------------------------------------------------------------------
 
 app.listen(PORT, () => {
