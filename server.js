@@ -1,201 +1,127 @@
 /**
  * HaloTasker Claude Chat - Backend API
- * Deploy this to Railway, then connect from your Lovable frontend
+ * Lovable + Railway compatible (non-streaming, always 200 responses)
  */
 
-import express from 'express';
-import rateLimit from 'express-rate-limit';
-import helmet from 'helmet';
-import cors from 'cors';
-import Anthropic from '@anthropic-ai/sdk';
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import Anthropic from "@anthropic-ai/sdk";
 
-// ==========================================================================
-// Configuration
-// ==========================================================================
+// -----------------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------------
 
-const CONFIG = {
-    port: process.env.PORT || 3000,
-    model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514',
-    maxTokens: parseInt(process.env.MAX_TOKENS, 10) || 4096,
-    maxInputTokens: parseInt(process.env.MAX_INPUT_TOKENS, 10) || 100000,
-    rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 60000,
-    rateLimitMaxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS, 10) || 20,
-    maxMessageLength: 32000,
-    maxHistoryMessages: 50,
-    allowedOrigins: process.env.ALLOWED_ORIGINS 
-        ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-        : ['http://localhost:3000', 'http://localhost:5173'],
-    isDev: process.env.NODE_ENV !== 'production'
-};
+const PORT = process.env.PORT || 3000;
 
-// Validate API key
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
+  : [];
+
 if (!process.env.ANTHROPIC_API_KEY) {
-    console.error('❌ ANTHROPIC_API_KEY environment variable is required');
-    process.exit(1);
+  console.error("ANTHROPIC_API_KEY is missing");
+  process.exit(1);
 }
 
-// Initialize Anthropic
 const anthropic = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY
+  apiKey: process.env.ANTHROPIC_API_KEY
 });
 
-// ==========================================================================
-// Express Setup
-// ==========================================================================
+// -----------------------------------------------------------------------------
+// App setup
+// -----------------------------------------------------------------------------
 
 const app = express();
 
-// Security
 app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: "1mb" }));
 
-// CORS - Allow your Lovable frontend
-app.use(cors({
+app.use(
+  cors({
     origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (CONFIG.allowedOrigins.includes(origin) || CONFIG.isDev) {
-            callback(null, true);
-        } else {
-            console.log(`CORS blocked: ${origin}`);
-            callback(new Error('CORS not allowed'));
-        }
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      return callback(null, false);
     },
     credentials: true
-}));
+  })
+);
 
-// Body parsing
-app.use(express.json({ limit: '1mb' }));
-
-// Request logging
-app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-    next();
-});
-
-// Rate limiting
 const limiter = rateLimit({
-    windowMs: CONFIG.rateLimitWindowMs,
-    max: CONFIG.rateLimitMaxRequests,
-    message: { error: 'Too many requests. Please wait.' },
-    standardHeaders: true,
-    legacyHeaders: false
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false
 });
 
-app.use('/api/', limiter);
+app.use("/api/", limiter);
 
-// ==========================================================================
-// API Routes
-// ==========================================================================
+// -----------------------------------------------------------------------------
+// Routes
+// -----------------------------------------------------------------------------
 
-// Health check
-app.get('/', (req, res) => {
-    res.json({ status: 'ok', message: 'HaloTasker Claude API' });
+app.get("/", (req, res) => {
+  res.json({ status: "ok", service: "HaloTasker Claude API" });
 });
 
-app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        model: CONFIG.model
-    });
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    model: "claude-sonnet-4-20250514"
+  });
 });
 
-// Chat endpoint with streaming
-app.post('/api/chat', async (req, res) => {
-    try {
-        const { message, history = [] } = req.body;
-        
-        // Validate message
-        if (!message || typeof message !== 'string') {
-            return res.status(400).json({ error: 'Message is required' });
-        }
-        
-        if (message.length > CONFIG.maxMessageLength) {
-            return res.status(400).json({ error: 'Message too long' });
-        }
-        
-        if (!message.trim()) {
-            return res.status(400).json({ error: 'Message cannot be empty' });
-        }
-        
-        // Sanitize history
-        const sanitizedHistory = Array.isArray(history) 
-            ? history
-                .slice(-CONFIG.maxHistoryMessages)
-                .filter(msg => 
-                    msg && 
-                    ['user', 'assistant'].includes(msg.role) &&
-                    typeof msg.content === 'string' &&
-                    msg.content.length <= CONFIG.maxMessageLength
-                )
-                .map(msg => ({
-                    role: msg.role,
-                    content: msg.content.trim()
-                }))
-            : [];
-        
-        // Build messages
-        const messages = [
-            ...sanitizedHistory,
-            { role: 'user', content: message.trim() }
-        ];
-        
-        // Set SSE headers
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        
-        // Stream from Claude
-        const stream = anthropic.messages.stream({
-            model: CONFIG.model,
-            max_tokens: CONFIG.maxTokens,
-            messages: messages,
-            system: `You are a helpful AI assistant for HaloTasker. Be helpful, professional, and concise. Use markdown formatting when appropriate.`
-        });
-        
-        stream.on('text', (text) => {
-            res.write(`data: ${JSON.stringify({ type: 'content', text })}\n\n`);
-        });
-        
-        stream.on('error', (error) => {
-            console.error('Stream error:', error);
-            res.write(`data: ${JSON.stringify({ type: 'error', message: 'An error occurred' })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-        });
-        
-        stream.on('end', () => {
-            res.write('data: [DONE]\n\n');
-            res.end();
-        });
-        
-        req.on('close', () => {
-            stream.abort();
-        });
-        
-        await stream.finalMessage();
-        
-    } catch (error) {
-        console.error('Chat error:', error);
-        
-        if (!res.headersSent) {
-            res.status(500).json({ error: 'An error occurred' });
-        } else {
-            res.write(`data: ${JSON.stringify({ type: 'error', message: 'An error occurred' })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-        }
+app.post("/api/chat", async (req, res) => {
+  try {
+    const { message, history = [] } = req.body;
+
+    if (!message || typeof message !== "string") {
+      return res.json({
+        reply: "Please send a valid message."
+      });
     }
+
+    const messages = [
+      ...Array.isArray(history)
+        ? history.filter(
+            m =>
+              m &&
+              (m.role === "user" || m.role === "assistant") &&
+              typeof m.content === "string"
+          )
+        : [],
+      { role: "user", content: message.trim() }
+    ];
+
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1024,
+      messages,
+      system:
+        "You are a helpful, professional AI assistant for HaloTasker. Be clear, concise, and friendly."
+    });
+
+    const text =
+      response?.content?.[0]?.text ||
+      "Sorry, I didn’t get a response. Please try again.";
+
+    return res.json({ reply: text });
+  } catch (error) {
+    console.error("Claude API error:", error);
+
+    // IMPORTANT: Always return 200 for Lovable compatibility
+    return res.json({
+      reply: "Sorry, something went wrong. Please try again."
+    });
+  }
 });
 
-// ==========================================================================
-// Start Server
-// ==========================================================================
+// -----------------------------------------------------------------------------
+// Start
+// -----------------------------------------------------------------------------
 
-app.listen(CONFIG.port, () => {
-    console.log(`
-🚀 HaloTasker Claude API running on port ${CONFIG.port}
-📡 Allowed origins: ${CONFIG.allowedOrigins.join(', ')}
-🤖 Model: ${CONFIG.model}
-    `);
+app.listen(PORT, () => {
+  console.log(`HaloTasker Claude API running on port ${PORT}`);
 });
