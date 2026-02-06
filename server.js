@@ -1,3 +1,5 @@
+const app = express();
+app.set("trust proxy", 1);
 /**
  * HaloTasker Claude API – Production Server
  * Default model: Opus 4.6
