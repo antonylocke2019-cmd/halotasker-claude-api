@@ -1,11 +1,3 @@
-const app = express();
-app.set("trust proxy", 1);
-/**
- * HaloTasker Claude API – Production Server
- * Default model: Opus 4.6
- * Supports: extended thinking, files, images, cost tracking
- */
-
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -14,7 +6,14 @@ import multer from "multer";
 import Anthropic from "@anthropic-ai/sdk";
 
 const app = express();
+app.set("trust proxy", 1);
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
+
+/**
+ * HaloTasker Claude API – Production Server
+ * Default model: Claude Opus 4.6
+ * Supports: extended thinking, files, images, cost tracking
+ */
 
 // -----------------------------------------------------------------------------
 // ENV + CONFIG
@@ -30,14 +29,14 @@ if (!API_KEY) {
 
 const anthropic = new Anthropic({ apiKey: API_KEY });
 
-// Pricing (approx USD per 1M tokens – conservative)
+// Pricing (USD per 1M tokens)
 const PRICING = {
-  "opus-4.6": { input: 15.0, output: 75.0 },
-  "sonnet-4.5": { input: 3.0, output: 15.0 },
-  "haiku-4.5": { input: 0.25, output: 1.25 }
+  "claude-opus-4-6": { input: 5.0, output: 25.0 },
+  "claude-sonnet-4-5-20250929": { input: 3.0, output: 15.0 },
+  "claude-haiku-4-5-20251001": { input: 0.25, output: 1.25 }
 };
 
-const DEFAULT_MODEL = "opus-4.6";
+const DEFAULT_MODEL = "claude-opus-4-6";
 
 // -----------------------------------------------------------------------------
 // MIDDLEWARE
