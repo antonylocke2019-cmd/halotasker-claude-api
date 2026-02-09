@@ -1,10 +1,6 @@
 /**
- * HaloTasker Claude API – Stable Production Server
- * Supports:
- * - Text + image uploads
- * - Claude Opus 4.6 / Sonnet / Haiku
- * - Lovable multipart requests
- * - Cost tracking
+ * HaloTasker Claude API – Hardened Production Server
+ * Fixes Claude request failed errors
  */
 
 import express from "express";
@@ -31,7 +27,6 @@ if (!API_KEY) {
 
 const anthropic = new Anthropic({ apiKey: API_KEY });
 
-// Claude models
 const MODELS = {
   OPUS: "claude-opus-4-6",
   SONNET: "claude-3-5-sonnet-20241022",
@@ -39,13 +34,6 @@ const MODELS = {
 };
 
 const DEFAULT_MODEL = MODELS.SONNET;
-
-// Pricing per 1M tokens (USD)
-const PRICING = {
-  [MODELS.OPUS]: { input: 5.0, output: 25.0 },
-  [MODELS.SONNET]: { input: 3.0, output: 15.0 },
-  [MODELS.HAIKU]: { input: 0.25, output: 1.25 }
-};
 
 // --------------------------------------------------
 // MIDDLEWARE
@@ -64,36 +52,42 @@ app.use(
   })
 );
 
-// Multer for Lovable file uploads
 const upload = multer({
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 }
 });
 
 // --------------------------------------------------
 // HELPERS
 // --------------------------------------------------
 
-function estimateCost(model, usage) {
-  if (!usage || !PRICING[model]) return 0;
-
-  const input =
-    (usage.input_tokens / 1_000_000) * PRICING[model].input;
-  const output =
-    (usage.output_tokens / 1_000_000) * PRICING[model].output;
-
-  return Number((input + output).toFixed(4));
+function safeText(text) {
+  return typeof text === "string" && text.trim()
+    ? text.trim()
+    : null;
 }
 
-function buildUserContent({ message, files }) {
+function normaliseHistory(history) {
+  if (!Array.isArray(history)) return [];
+
+  return history
+    .filter(h => h && h.role && h.content)
+    .map(h => ({
+      role: h.role === "assistant" ? "assistant" : "user",
+      content: [{ type: "text", text: String(h.content) }]
+    }));
+}
+
+function buildUserContent(message, files) {
   const content = [];
 
-  if (message?.trim()) {
-    content.push({ type: "text", text: message });
+  const text = safeText(message);
+  if (text) {
+    content.push({ type: "text", text });
   }
 
-  if (files?.length) {
+  if (Array.isArray(files)) {
     for (const file of files) {
-      if (file.mimetype.startsWith("image/")) {
+      if (file.mimetype?.startsWith("image/")) {
         content.push({
           type: "image",
           source: {
@@ -102,15 +96,12 @@ function buildUserContent({ message, files }) {
             data: file.buffer.toString("base64")
           }
         });
-      } else {
-        content.push({
-          type: "text",
-          text: `Attached file (${file.originalname}):\n${file.buffer
-            .toString("utf8")
-            .slice(0, 12_000)}`
-        });
       }
     }
+  }
+
+  if (!content.length) {
+    content.push({ type: "text", text: " " });
   }
 
   return content;
@@ -128,75 +119,51 @@ app.get("/", (_, res) => {
   });
 });
 
-app.post(
-  "/api/chat",
-  upload.array("files"),
-  async (req, res) => {
-    try {
-      // IMPORTANT: Lovable sends different keys when files exist
-      const message =
-        req.body.message ||
-        req.body.prompt ||
-        req.body.input ||
-        req.body.content ||
-        req.body.text ||
-        "";
+app.post("/api/chat", upload.array("files"), async (req, res) => {
+  try {
+    const message =
+      req.body.message ||
+      req.body.prompt ||
+      req.body.text ||
+      "";
 
-      const history = req.body.history
-        ? JSON.parse(req.body.history)
-        : [];
+    const history = req.body.history
+      ? JSON.parse(req.body.history)
+      : [];
 
-      const model = req.body.model || DEFAULT_MODEL;
-      const extendedThinking = req.body.extendedThinking === "true";
+    const model = Object.values(MODELS).includes(req.body.model)
+      ? req.body.model
+      : DEFAULT_MODEL;
 
-      if (!message && !req.files?.length) {
-        return res.status(400).json({
-          error: "Message or file required"
-        });
-      }
-
-      const messages = [];
-
-      for (const h of history) {
-        messages.push({
-          role: h.role,
-          content: [{ type: "text", text: h.content }]
-        });
-      }
-
-      messages.push({
+    const messages = [
+      ...normaliseHistory(history),
+      {
         role: "user",
-        content: buildUserContent({
-          message,
-          files: req.files
-        })
-      });
+        content: buildUserContent(message, req.files)
+      }
+    ];
 
-      const response = await anthropic.messages.create({
-        model,
-        max_tokens: 4096,
-        messages,
-        thinking: extendedThinking ? { type: "extended" } : undefined
-      });
+    const response = await anthropic.messages.create({
+      model,
+      max_tokens: 4096,
+      messages
+    });
 
-      const reply =
-        response.content?.find(c => c.type === "text")?.text || "";
+    const reply =
+      response.content?.find(c => c.type === "text")?.text || "";
 
-      const lastCost = estimateCost(model, response.usage);
+    res.json({
+      reply,
+      usage: response.usage
+    });
 
-      res.json({
-        reply,
-        usage: response.usage,
-        cost: lastCost
-      });
-    } catch (err) {
-      console.error("❌ Claude error:", err);
-      res.status(500).json({
-        error: "Claude request failed"
-      });
-    }
+  } catch (err) {
+    console.error("❌ Claude failure:", err);
+    res.status(500).json({
+      error: "Claude request failed"
+    });
   }
-);
+});
 
 // --------------------------------------------------
 // START
