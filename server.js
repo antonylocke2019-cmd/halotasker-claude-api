@@ -1,6 +1,10 @@
 /**
- * HaloTasker Claude API – Hardened Production Server
- * Fixes Claude request failed errors
+ * HaloTasker Claude API – Stable Production Server
+ * FIXES:
+ * - Prevents long replies being cut off
+ * - Detects truncated responses
+ * - Supports images + files
+ * - Works with Lovable multipart requests
  */
 
 import express from "express";
@@ -27,6 +31,7 @@ if (!API_KEY) {
 
 const anthropic = new Anthropic({ apiKey: API_KEY });
 
+// Claude models
 const MODELS = {
   OPUS: "claude-opus-4-6",
   SONNET: "claude-3-5-sonnet-20241022",
@@ -35,13 +40,16 @@ const MODELS = {
 
 const DEFAULT_MODEL = MODELS.SONNET;
 
+// IMPORTANT: allow long outputs
+const MAX_OUTPUT_TOKENS = 8192;
+
 // --------------------------------------------------
 // MIDDLEWARE
 // --------------------------------------------------
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 app.use(
   rateLimit({
@@ -52,42 +60,25 @@ app.use(
   })
 );
 
+// Multer for images/files
 const upload = multer({
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
 });
 
 // --------------------------------------------------
 // HELPERS
 // --------------------------------------------------
 
-function safeText(text) {
-  return typeof text === "string" && text.trim()
-    ? text.trim()
-    : null;
-}
-
-function normaliseHistory(history) {
-  if (!Array.isArray(history)) return [];
-
-  return history
-    .filter(h => h && h.role && h.content)
-    .map(h => ({
-      role: h.role === "assistant" ? "assistant" : "user",
-      content: [{ type: "text", text: String(h.content) }]
-    }));
-}
-
-function buildUserContent(message, files) {
+function buildUserContent({ message, files }) {
   const content = [];
 
-  const text = safeText(message);
-  if (text) {
-    content.push({ type: "text", text });
+  if (message?.trim()) {
+    content.push({ type: "text", text: message });
   }
 
-  if (Array.isArray(files)) {
+  if (files?.length) {
     for (const file of files) {
-      if (file.mimetype?.startsWith("image/")) {
+      if (file.mimetype.startsWith("image/")) {
         content.push({
           type: "image",
           source: {
@@ -96,12 +87,15 @@ function buildUserContent(message, files) {
             data: file.buffer.toString("base64")
           }
         });
+      } else {
+        content.push({
+          type: "text",
+          text: `Attached file (${file.originalname}):\n${file.buffer
+            .toString("utf8")
+            .slice(0, 12000)}`
+        });
       }
     }
-  }
-
-  if (!content.length) {
-    content.push({ type: "text", text: " " });
   }
 
   return content;
@@ -121,9 +115,11 @@ app.get("/", (_, res) => {
 
 app.post("/api/chat", upload.array("files"), async (req, res) => {
   try {
+    // Lovable sends different keys depending on context
     const message =
       req.body.message ||
       req.body.prompt ||
+      req.body.input ||
       req.body.text ||
       "";
 
@@ -131,34 +127,49 @@ app.post("/api/chat", upload.array("files"), async (req, res) => {
       ? JSON.parse(req.body.history)
       : [];
 
-    const model = Object.values(MODELS).includes(req.body.model)
-      ? req.body.model
-      : DEFAULT_MODEL;
+    const model = req.body.model || DEFAULT_MODEL;
 
-    const messages = [
-      ...normaliseHistory(history),
-      {
-        role: "user",
-        content: buildUserContent(message, req.files)
-      }
-    ];
+    if (!message && !req.files?.length) {
+      return res.status(400).json({
+        error: "Message or file required"
+      });
+    }
+
+    const messages = [];
+
+    for (const h of history) {
+      messages.push({
+        role: h.role,
+        content: [{ type: "text", text: h.content }]
+      });
+    }
+
+    messages.push({
+      role: "user",
+      content: buildUserContent({
+        message,
+        files: req.files
+      })
+    });
 
     const response = await anthropic.messages.create({
       model,
-      max_tokens: 4096,
+      max_tokens: MAX_OUTPUT_TOKENS,
       messages
     });
 
     const reply =
       response.content?.find(c => c.type === "text")?.text || "";
 
+    const truncated = response.stop_reason === "max_tokens";
+
     res.json({
       reply,
+      truncated,
       usage: response.usage
     });
-
   } catch (err) {
-    console.error("❌ Claude failure:", err);
+    console.error("❌ Claude API error:", err);
     res.status(500).json({
       error: "Claude request failed"
     });
@@ -170,5 +181,5 @@ app.post("/api/chat", upload.array("files"), async (req, res) => {
 // --------------------------------------------------
 
 app.listen(PORT, () => {
-  console.log(`🚀 HaloTasker Claude API running on ${PORT}`);
+  console.log(`🚀 HaloTasker Claude API running on port ${PORT}`);
 });
